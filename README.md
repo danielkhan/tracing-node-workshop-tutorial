@@ -47,9 +47,9 @@ To install the build tools, run `npm install --global windows-build-tools`.
 Next open `/montoring/index.js` and add
 
 ```js
-module.exports.metrics = (host, prefix) => {
+module.exports.metrics = (collector, handle, serviceName) => {
   const statsd = require('appmetrics-statsd').StatsD(
-    { host, prefix }
+    { host: collector, prefix: `${handle}_${serviceName}_` }
   );
   return {
     statsd,
@@ -64,12 +64,13 @@ So we open `app.js` in every service and add after `const serviceName ...`:
 
 ```js
 const monitoring = require('../monitoring');
-const metrics = monitoring.metrics(process.env.COLLECTOR, `${process.env.MY_HANDLE}_${serviceName}_`);
+const metrics = monitoring.metrics(process.env.COLLECTOR, process.env.MY_HANDLE, serviceName);
 ```
 
 Hit `http://localhost:8080` a few times.
 
 In Grafana, all your metrics will be prefixed with your handle.
+If you save a dashboard, make sure that you prefix it with your handle as well.
 
 ## Creating a dashboard in Grafana
 Follow the instructions during the workshop.
@@ -138,64 +139,119 @@ Restart the services and hit `http://localhost:8080` a few times again.
 Follow the instructions in the workshop.
 The metric to look for is `<your_handle>_service-gateway_http-express`.
 
-# Install Jaeger Tracing
+# Collecting traces
+While metrics can give us valuable insights, traces connect the dots.
+We will use Jaeger tracing as our backend and ui.
+It's already available on our monitoring server.
 
-```bash
-$ docker run -d --name jaeger \
-  -e COLLECTOR_ZIPKIN_HTTP_PORT=9411 \
-  -p 5775:5775/udp \
-  -p 6831:6831/udp \
-  -p 6832:6832/udp \
-  -p 5778:5778 \
-  -p 16686:16686 \
-  -p 14268:14268 \
-  -p 9411:9411 \
-  jaegertracing/all-in-one:1.13
-```
+You can reach the frontend at the monitoring server
+on port `16686`.
 
-Frontend `http://tracing.khan.io:16686`.
+
+The architecture behind Jaeger looks like that:
 
 ![Jaeger Architecture](./assets/jaeger-architecture.png)
 
-# Install Opencensus Node
+## Install Opencensus Node
 
+The backend alone does not give us much.
+We need to collect traces inside our services.
+
+For that, we will use opencensus.
+
+In `/monitoring` we install it by running
 `npm install @opencensus/nodejs --save`
 
-express-frontend: `app.js`
+In our exported function, we add
+```js
 const tracing = require('@opencensus/nodejs');
 tracing.start();
-
-Hit `http://localhost:8080` a few times.
-
-
-Install `npm install @opencensus/exporter-jaeger -S`
-
-```js
-// bin/www
-const tracing = require('@opencensus/nodejs');
-const JaegerTraceExporter = require('@opencensus/exporter-jaeger').JaegerTraceExporter;
-
-const options = {
-  serviceName: 'express-frontend',
-  host: process.env.COLLECTOR,
+// and add it to the returned properties:
+return {
+  statsd,
+  middleware,
+  tracing,
 }
-const exporter = new JaegerTraceExporter(options);
-tracing.start({ exporter });
 ```
 
-Hit the webpage
+This should set up tracing when the module is initialized.
+Let's re-run all services and hit `http://localhost:8080` a few times.
 
-Open `http://tracing.khan.io:16686`.
+If we wait roughly a minute, we will see that the console now starts spitting out tracing information.
+This means, that the tracing functionality basically works but
+right now, we only export it to the console.
 
-# Propagation
+We need to find a way to tell OpenCensus that it should export
+to the Jaeger endpoint at the monitoring host.
 
-Add console.log(req.headers) to middleware in service-gateway
+## Exporting traces to Jaeger
+
+Luckily, there is an exporter für Jaeger available.
+So in `/monitoring` we run `npm install @opencensus/exporter-jaeger -S`
+
+Next we will extend the monitoring module:
+```js
+  const tracing = require('@opencensus/nodejs');
+  const JaegerTraceExporter = require('@opencensus/exporter-jaeger').JaegerTraceExporter;
+  const options = {
+    serviceName: `${handle}_${serviceName}`,
+    host: collector,
+  }
+  const exporter = new JaegerTraceExporter(options);
+  tracing.start({ exporter });
+```
+
+Restart all services and hit the webpage a few times.
+
+Open the jaeger UI on the tracing server on port `16686`.
+You should find services prefixed with your handle there.
+
+![Jaeger short trace](./assets/jaeger-short-trace.png)
+
+If we look at the traces starting from `express-service` we see that
+the rsult is not exactly what we wanted to see.
+We wanted distributed tracing but we only see the outbound call as a span but
+no connection to the other services.
+
+Obviously, Jaeger and OpenCensus have no way to correlate those different invocations together.
+This is where context propagation comes into place.
+
+Let's get a bit more insights by adding `console.log(req.headers)` to the metrics
+middleware for the sake of debugging.
+Restart all services and hit the app.
+We see that the headers passed between the services don't contain any context information.
+
+This is because we need to explicitely enable context propagation in OpenCensus and
+we also have to choose a format. We will use the new w3c standard `trace-cntext` for that.
+
+## Add context propagation
+
+In `/monitoring` we run.
 
 `npm install @opencensus/propagation-tracecontext -S`
 
+And we add to the monitoring function:
+
+```js
 const propagation = require('@opencensus/propagation-tracecontext');
 const traceContext = new propagation.TraceContextFormat();
 
 tracing.start({ exporter, propagation: traceContext });
+```
 
-Compare
+Let's restart all services and try it again.
+We see that now we have a new header `traceparent` that contains the context information
+that is needed to correlate transactions between services.
+
+If we head back to Jaeger, we now have long traces through all services.
+![Jaeger long trace](./assets/jaeger-long-trace.png)
+
+## Comparing traces
+Now to debug the problem we are having (the error 500), we can compare different traces.
+Let's do that.
+
+Select a trace that uses `service-green` and one that uses `service-blue` and click
+`Compare traces` and the resulting graph cleary tells us that calls to `service-blue` are
+failing.
+
+![Jaeger compare](./assets/jaeger-compare.png)
