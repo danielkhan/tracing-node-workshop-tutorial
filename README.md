@@ -1,7 +1,7 @@
 This repository contains material for my workshop Tracing Node.
 
 # Setting up all services
-1. Clone the repository `git clone git@github.com:danielkhan/tracing-node-workshop.git`.
+1. Clone the repository `git clone https://github.com/danielkhan/tracing-node-workshop.git`.
 2. Copy `/.env-sample` to `/.env`.
 3. Fill in the information provided.
 4. Create 4 terminal windows.
